@@ -15,6 +15,16 @@
 #define ONE_WIRE_BUS 4
 #define BOMB_PIN 25
 
+// --- Identificador único del dispositivo ---
+#define DEVICE_ID "riego_esp32_01" // Cambia este valor para cada dispositivo "riego_esp32_XX"
+
+// --- Tópicos MQTT generados automáticamente ---
+#define MQTT_TOPIC_BASE "sensors/" DEVICE_ID
+#define MQTT_TOPIC_CONFIG MQTT_TOPIC_BASE "/config"
+
+// --- Nombre de cliente MQTT único ---
+#define MQTT_CLIENT_NAME "ESP32Client_" DEVICE_ID
+
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
@@ -89,7 +99,7 @@ void callback(char *topic, byte *payload, unsigned int length)
   }
   Serial.println("Mensaje recibido: " + msg);
 
-  if (String(topic) == "sensors/riego_esp32_01/config")
+  if (String(topic) == MQTT_TOPIC_CONFIG)
   {
     DynamicJsonDocument doc(128);
     DeserializationError error = deserializeJson(doc, msg);
@@ -114,10 +124,10 @@ void reconnect()
   while (!client.connected())
   {
     Serial.print("Conectando a MQTT...");
-    if (client.connect("ESP32Client", MQTT_USER, MQTT_PASSWORD))
+    if (client.connect(MQTT_CLIENT_NAME, MQTT_USER, MQTT_PASSWORD))
     {
       Serial.println("conectado!");
-      client.subscribe("sensors/riego_esp32_01/config"); // <-- Escuchar config
+      client.subscribe(MQTT_TOPIC_CONFIG); // <-- Escuchar config
     }
     else
     {
@@ -136,7 +146,7 @@ bool esHoraDeDormir()
   struct tm timeinfo;
   localtime_r(&now, &timeinfo);
   int hora = timeinfo.tm_hour;
-  return (hora >= 20 || hora < 10);
+  return (hora >= 21 || hora < 10);
 }
 
 // Devuelve microsegundos hasta las 10:00 del día siguiente
@@ -222,18 +232,16 @@ void setup()
 
 void loop()
 {
-  // Solo necesitas esta comprobación al inicio del loop
   if (esHoraDeDormir())
   {
     printLog("Horario nocturno (20h-10h). Entrando en sueño profundo.");
     uint64_t microsSleep = microsHastaLas10();
     if (microsSleep > 0)
     {
-      // Notifica por MQTT antes de dormir
-      client.publish("sensors/riego_esp32_01", "{\"evento\":\"sleep_nocturno\"}");
-      delay(100); // Permite enviar el mensaje
+      client.publish(MQTT_TOPIC_BASE, "{\"evento\":\"sleep_nocturno\"}");
+      delay(100);
       esp_sleep_enable_timer_wakeup(microsSleep);
-      delay(100); // Permite imprimir el mensaje
+      delay(100);
       esp_deep_sleep_start();
     }
   }
@@ -297,7 +305,7 @@ void loop()
   char payload[160];
   snprintf(payload, sizeof(payload), "{\"humedad\":%.1f,\"temperatura\":%.1f,\"umbral\":%.1f,\"duracion\":%lu}",
            lastHumedad, tempC, humedadUmbral, duracionRiego);
-  client.publish("sensors/riego_esp32_01", payload);
+  client.publish(MQTT_TOPIC_BASE, payload);
 
   delay(5000);
 }
