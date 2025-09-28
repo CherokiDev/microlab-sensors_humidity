@@ -10,13 +10,14 @@
 #include "esp_sleep.h"
 
 #define HUMIDITY_SENSOR_PIN 34
+#define WATER_LEVEL_SENSOR_PIN 35
 #define TIERRA_SECA 4095
 #define TIERRA_HUMEDA 1000
 #define ONE_WIRE_BUS 4
 #define BOMB_PIN 25
 
 // --- Identificador único del dispositivo ---
-#define DEVICE_ID "riego_esp32_01" // Cambia este valor para cada dispositivo "riego_esp32_XX"
+#define DEVICE_ID "riego_esp32_name_device" // Cambia este valor para cada dispositivo "riego_esp32_name_device"
 
 // --- Tópicos MQTT generados automáticamente ---
 #define MQTT_TOPIC_BASE "sensors/" DEVICE_ID
@@ -34,6 +35,8 @@ Preferences preferences; // <-- Instancia de almacenamiento
 
 float humedadUmbral = 75.0;           // valor por defecto si no hay nada en memoria
 unsigned long duracionRiego = 120000; // 2 minutos por defecto (en ms)
+bool nivelAgua = true;                // Estado del nivel de agua
+bool bloqueoSinAgua = false;          // Bloqueo de riego si no hay agua
 
 // --- Prototipo de printLog ---
 void printLog(const String &mensaje);
@@ -180,6 +183,7 @@ void setup()
 {
   Serial.begin(115200);
   pinMode(HUMIDITY_SENSOR_PIN, INPUT);
+  pinMode(WATER_LEVEL_SENSOR_PIN, INPUT);
   sensors.begin();
   pinMode(BOMB_PIN, OUTPUT);
   digitalWrite(BOMB_PIN, LOW);
@@ -232,6 +236,28 @@ void setup()
 
 void loop()
 {
+  // Leer sensor de nivel de agua
+  int valorNivel = analogRead(WATER_LEVEL_SENSOR_PIN);
+  if (valorNivel < 100)
+  {
+    nivelAgua = true; // Agua detectada
+  }
+  else if (valorNivel > 4000)
+  {
+    nivelAgua = false; // Sin agua
+  }
+  // Si no hay agua, activar bloqueo
+  if (!nivelAgua)
+  {
+    bloqueoSinAgua = true;
+  }
+  // Si vuelve a haber agua, quitar bloqueo
+  if (nivelAgua && bloqueoSinAgua)
+  {
+    bloqueoSinAgua = false;
+    printLog("Agua detectada, desbloqueando riego.");
+  }
+
   if (esHoraDeDormir())
   {
     printLog("Horario nocturno (20h-10h). Entrando en sueño profundo.");
@@ -260,7 +286,16 @@ void loop()
 
   if (bombaEncendida)
   {
-    if (millis() - bombaStartMillis >= duracionRiego) // <-- usar variable
+    // Verifica si el depósito se queda sin agua mientras riega
+    int valorNivel = analogRead(WATER_LEVEL_SENSOR_PIN);
+    if (valorNivel > 4000)
+    {
+      digitalWrite(BOMB_PIN, LOW);
+      bombaEncendida = false;
+      bloqueoSinAgua = true;
+      printLog("Bomba APAGADA: SIN AGUA detectado durante riego.");
+    }
+    else if (millis() - bombaStartMillis >= duracionRiego)
     {
       digitalWrite(BOMB_PIN, LOW);
       bombaEncendida = false;
@@ -285,26 +320,32 @@ void loop()
 
     lastHumedad = humedad;
 
-    if (consecutiveBelow == 3 && !bombaEncendida)
+    // Solo riega si no está bloqueado por falta de agua
+    if (consecutiveBelow == 3 && !bombaEncendida && !bloqueoSinAgua)
     {
       digitalWrite(BOMB_PIN, HIGH);
       bombaEncendida = true;
       bombaStartMillis = millis();
       printLog("Bomba ENCENDIDA (humedad < " + String(humedadUmbral) + "%)");
     }
+    // Si está bloqueado, loguea
+    if (consecutiveBelow == 3 && bloqueoSinAgua)
+    {
+      printLog("No se puede regar: SIN AGUA");
+    }
   }
 
   sensors.requestTemperatures();
   float tempC = sensors.getTempCByIndex(0);
 
-  char logMsg[96];
-  snprintf(logMsg, sizeof(logMsg), "Humedad: %.1f %% | Temp: %.1f °C | Umbral: %.1f %% | Riego: %lus",
-           lastHumedad, tempC, humedadUmbral, duracionRiego / 1000);
+  char logMsg[128];
+  snprintf(logMsg, sizeof(logMsg), "Humedad: %.1f %% | Temp: %.1f °C | Umbral: %.1f %% | Riego: %lus | Agua: %s",
+           lastHumedad, tempC, humedadUmbral, duracionRiego / 1000, nivelAgua ? "SI" : "NO");
   printLog(logMsg);
 
-  char payload[160];
-  snprintf(payload, sizeof(payload), "{\"humedad\":%.1f,\"temperatura\":%.1f,\"umbral\":%.1f,\"duracion\":%lu}",
-           lastHumedad, tempC, humedadUmbral, duracionRiego);
+  char payload[192];
+  snprintf(payload, sizeof(payload), "{\"humedad\":%.1f,\"temperatura\":%.1f,\"umbral\":%.1f,\"duracion\":%lu,\"nivel_agua\":%s}",
+           lastHumedad, tempC, humedadUmbral, duracionRiego, nivelAgua ? "true" : "false");
   client.publish(MQTT_TOPIC_BASE, payload);
 
   delay(5000);
