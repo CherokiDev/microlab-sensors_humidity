@@ -15,6 +15,7 @@
 #define TIERRA_HUMEDA 1000
 #define ONE_WIRE_BUS 4
 #define BOMB_PIN 25
+#define DEEP_SLEEP_SECONDS 60
 
 // --- Identificador único del dispositivo ---
 #define DEVICE_ID "riego_esp32_name_device" // Cambia este valor para cada dispositivo "riego_esp32_name_device"
@@ -33,7 +34,7 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 Preferences preferences; // <-- Instancia de almacenamiento
 
-float humedadUmbral = 75.0;           // valor por defecto si no hay nada en memoria
+float humedadUmbral = 70.0;           // valor por defecto si no hay nada en memoria
 unsigned long duracionRiego = 120000; // 2 minutos por defecto (en ms)
 bool nivelAgua = true;                // Estado del nivel de agua
 bool bloqueoSinAgua = false;          // Bloqueo de riego si no hay agua
@@ -149,7 +150,7 @@ bool esHoraDeDormir()
   struct tm timeinfo;
   localtime_r(&now, &timeinfo);
   int hora = timeinfo.tm_hour;
-  return (hora >= 21 || hora < 10);
+  return (hora >= 20 || hora < 10);
 }
 
 // Devuelve microsegundos hasta las 10:00 del día siguiente
@@ -182,14 +183,16 @@ uint64_t microsHastaLas10()
 void setup()
 {
   Serial.begin(115200);
+  printLog("ESP32 despertado (inicio de ciclo)");
+
   pinMode(HUMIDITY_SENSOR_PIN, INPUT);
   pinMode(WATER_LEVEL_SENSOR_PIN, INPUT);
   sensors.begin();
   pinMode(BOMB_PIN, OUTPUT);
   digitalWrite(BOMB_PIN, LOW);
 
-  loadThreshold(); // <-- cargar umbral de memoria al inicio
-  loadDuracion();  // <-- cargar duración de memoria al inicio
+  loadThreshold(); // cargar umbral de memoria al inicio
+  loadDuracion();  // cargar duración de memoria al inicio
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Conectando a WiFi");
@@ -231,7 +234,7 @@ void setup()
   }
 
   client.setServer(MQTT_SERVER, MQTT_PORT);
-  client.setCallback(callback); // <-- Escucha mensajes entrantes
+  client.setCallback(callback); // Escucha mensajes entrantes
 }
 
 void loop()
@@ -265,7 +268,7 @@ void loop()
     if (microsSleep > 0)
     {
       client.publish(MQTT_TOPIC_BASE, "{\"evento\":\"sleep_nocturno\"}");
-      delay(100);
+      delay(5000); // Espera para asegurar el envío
       esp_sleep_enable_timer_wakeup(microsSleep);
       delay(100);
       esp_deep_sleep_start();
@@ -348,5 +351,17 @@ void loop()
            lastHumedad, tempC, humedadUmbral, duracionRiego, nivelAgua ? "true" : "false");
   client.publish(MQTT_TOPIC_BASE, payload);
 
-  delay(5000);
+  printLog("Esperando posibles mensajes de configuración...");
+  unsigned long esperaConfig = millis();
+  while (millis() - esperaConfig < 5000)
+  {
+    client.loop();
+    delay(10);
+  }
+
+  printLog("Entrando en deep sleep por " + String(DEEP_SLEEP_SECONDS) + " segundos para ahorrar batería.");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_SECONDS * 1000000);
+  esp_deep_sleep_start();
 }
