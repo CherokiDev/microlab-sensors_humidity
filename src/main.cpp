@@ -94,6 +94,17 @@ void loadThreshold()
   printLog("Umbral cargado: " + String(humedadUmbral));
 }
 
+// --- NUEVA FUNCIÓN: espera procesando MQTT ---
+void delayWithMQTT(unsigned long ms)
+{
+  unsigned long start = millis();
+  while (millis() - start < ms)
+  {
+    client.loop(); // procesa callbacks mientras esperamos
+    delay(10);
+  }
+}
+
 void callback(char *topic, byte *payload, unsigned int length)
 {
   String msg;
@@ -237,6 +248,11 @@ void setup()
   client.setCallback(callback); // Escucha mensajes entrantes
 }
 
+// --- Variables globales para estado de riego ---
+bool bombaEncendida = false;
+unsigned long bombaStartMillis = 0;
+float lastHumedad = 0;
+
 void loop()
 {
   // Leer sensor de nivel de agua
@@ -267,8 +283,8 @@ void loop()
     uint64_t microsSleep = microsHastaLas10();
     if (microsSleep > 0)
     {
-      client.publish(MQTT_TOPIC_BASE, "{\"evento\":\"sleep_nocturno\"}");
-      delay(5000); // Espera para asegurar el envío
+      client.publish(MQTT_TOPIC_BASE, "{\"evento\":\"sleep_nocturno\"}", true); // Retained!
+      delay(500);                                                               // Espera para asegurar el envío
       esp_sleep_enable_timer_wakeup(microsSleep);
       delay(100);
       esp_deep_sleep_start();
@@ -280,10 +296,6 @@ void loop()
     reconnect();
   }
   client.loop();
-
-  static bool bombaEncendida = false;
-  static unsigned long bombaStartMillis = 0;
-  static float lastHumedad = 0;
 
   float humedad = lastHumedad;
 
@@ -318,7 +330,8 @@ void loop()
       {
         consecutiveBelow++;
       }
-      delay(2000);
+      // Espera 2s pero sigue atendiendo MQTT para aplicar cambios inmediatamente
+      delayWithMQTT(2000);
     }
 
     lastHumedad = humedad;
@@ -349,7 +362,7 @@ void loop()
   char payload[192];
   snprintf(payload, sizeof(payload), "{\"humedad\":%.1f,\"temperatura\":%.1f,\"umbral\":%.1f,\"duracion\":%lu,\"nivel_agua\":%s}",
            lastHumedad, tempC, humedadUmbral, duracionRiego, nivelAgua ? "true" : "false");
-  client.publish(MQTT_TOPIC_BASE, payload);
+  client.publish(MQTT_TOPIC_BASE, payload, true); // Retained!
 
   printLog("Esperando posibles mensajes de configuración...");
   unsigned long esperaConfig = millis();
@@ -357,6 +370,15 @@ void loop()
   {
     client.loop();
     delay(10);
+  }
+
+  // Si la bomba está ENCENDIDA, no entrar en deep sleep: dejar que el loop siga
+  // controlando el tiempo de riego y el apagado por duración o falta de agua.
+  if (bombaEncendida)
+  {
+    printLog("Bomba en funcionamiento; posponiendo deep sleep hasta finalizar riego.");
+    // Volver al inicio de loop para gestionar la duración de riego sin dormir
+    return;
   }
 
   printLog("Entrando en deep sleep por " + String(DEEP_SLEEP_SECONDS) + " segundos para ahorrar batería.");
