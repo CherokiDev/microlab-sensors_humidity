@@ -422,8 +422,15 @@ void loop()
     removeEvent("pump_off_no_water");
     removeEvent("pump_blocked_no_water");
     addEvent("sleep_nocturno");
-    mqttClient.loop();
-    delay(100);
+
+    // Espera suficiente para asegurar envío MQTT
+    unsigned long t0 = millis();
+    while (millis() - t0 < 2000)
+    { // 2 segundos
+      mqttClient.loop();
+      delay(10);
+    }
+
     esp_sleep_enable_timer_wakeup(microsHastaLas10());
     esp_deep_sleep_start();
   }
