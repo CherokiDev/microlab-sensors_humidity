@@ -24,7 +24,7 @@ static constexpr int TIERRA_HUMEDA = 1000;
 
 // Device / MQTT
 #ifndef DEVICE_ID
-#define DEVICE_ID "jazmin"
+#define DEVICE_ID "device_name"
 #endif
 
 static const String MQTT_TOPIC_BASE = String("sensors/") + DEVICE_ID;
