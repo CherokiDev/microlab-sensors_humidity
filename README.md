@@ -1,5 +1,18 @@
 # Repaso punto por punto de la aplicación de riego automático con ESP32
 
+## Cambios principales en esta versión
+
+- Añadida sincronización de hora NTP.
+- La sincronización espera hasta un timeout configurable y reporta por MQTT si falla.
+- Mantiene el muestreo no bloqueante y la lógica de deep-sleep para ahorro energético.
+
+**Notas:**
+
+- La sincronización NTP se realiza sólo si hay conexión WiFi.
+- Si no se sincroniza en el tiempo límite, se publica un evento retenido `ntp_error` en `sensors/<DEVICE_ID>/events` para que el frontend muestre aviso.
+
+---
+
 ## 1. **Inicialización (`setup`)**
 
 - Inicializa el puerto serie para logs.
@@ -7,7 +20,8 @@
 - Inicializa el sensor de temperatura Dallas.
 - Carga el umbral de humedad y la duración de riego desde la memoria permanente.
 - Conecta a la red WiFi.
-- Sincroniza la hora con NTP.
+- Sincroniza la hora con NTP (España, CET/CEST), esperando hasta un timeout configurable.
+- Si la sincronización NTP falla, publica evento `ntp_error` por MQTT.
 - Configura el cliente MQTT y se suscribe al tópico de configuración.
 
 ---
@@ -41,7 +55,7 @@
   - Verifica si se queda sin agua durante el riego y apaga la bomba si es necesario.
   - Apaga la bomba cuando se cumple el tiempo de riego.
 - Si la bomba está apagada:
-  - Realiza 3 lecturas de humedad con un pequeño delay entre ellas.
+  - Realiza 3 lecturas de humedad con muestreo no bloqueante y un pequeño delay entre ellas.
   - Si las 3 lecturas están por debajo del umbral y no hay bloqueo, enciende la bomba y comienza el riego.
   - Si hay bloqueo por falta de agua, lo registra en el log.
 
