@@ -24,7 +24,7 @@ static constexpr int TIERRA_HUMEDA = 1000;
 
 // Device / MQTT
 #ifndef DEVICE_ID
-#define DEVICE_ID "riego_name_device"
+#define DEVICE_ID "jazmin"
 #endif
 
 static const String MQTT_TOPIC_BASE = String("sensors/") + DEVICE_ID;
@@ -209,7 +209,23 @@ void publishEvent(const char *json, bool retain = false)
 
 void addEvent(const char *evento)
 {
-  eventosPendientes.push_back(evento);
+  // Obtener fecha actual en formato ISO
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  char fecha[32];
+  strftime(fecha, sizeof(fecha), "%Y-%m-%dT%H:%M:%S%z", &timeinfo);
+
+  // Guardar evento como JSON string
+  DynamicJsonDocument docEv(64);
+  docEv["evento"] = evento;
+  docEv["fecha"] = fecha;
+  String evStr;
+  serializeJson(docEv, evStr);
+
+  eventosPendientes.push_back(evStr);
+
+  // Publicar array de eventos
   DynamicJsonDocument doc(256);
   JsonArray arr = doc.to<JsonArray>();
   for (const auto &ev : eventosPendientes)
@@ -221,9 +237,19 @@ void addEvent(const char *evento)
 
 void removeEvent(const char *evento)
 {
-  auto it = std::remove(eventosPendientes.begin(), eventosPendientes.end(), String(evento));
-  if (it != eventosPendientes.end())
-    eventosPendientes.erase(it, eventosPendientes.end());
+  eventosPendientes.erase(
+      std::remove_if(
+          eventosPendientes.begin(),
+          eventosPendientes.end(),
+          [evento](const String &evStr)
+          {
+            DynamicJsonDocument docEv(64);
+            DeserializationError err = deserializeJson(docEv, evStr);
+            if (err)
+              return false;
+            return docEv["evento"] == evento;
+          }),
+      eventosPendientes.end());
 }
 
 // -------------------- NTP / ZONA HORARIA ------------------------------------
