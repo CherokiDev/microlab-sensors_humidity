@@ -197,6 +197,15 @@ void publishState(float temp)
   doc["umbral"] = state.humedadUmbral;
   doc["duracion"] = state.duracionRiego;
   doc["nivel_agua"] = state.nivelAgua;
+
+  // Añadir timestamp en formato ISO
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  char fecha[32];
+  strftime(fecha, sizeof(fecha), "%Y-%m-%dT%H:%M:%S%z", &timeinfo);
+  doc["timestamp"] = fecha;
+
   char buf[256];
   size_t n = serializeJson(doc, buf);
   mqttClient.publish(MQTT_TOPIC_BASE.c_str(), buf, n);
@@ -412,6 +421,33 @@ void setup()
 
 void loop()
 {
+  // Reconexión WiFi si se pierde la conexión
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    printLog("WiFi desconectado. Reintentando conexión...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    int tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries < 10)
+    {
+      delay(500);
+      Serial.print('.');
+      tries++;
+    }
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      printLog("WiFi reconectado.");
+      // Re-sincroniza NTP si es necesario
+      ntpSynced = syncTimeSpain(NTP_TIMEOUT_MS);
+      mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+      mqttClient.setCallback(mqttCallback);
+    }
+    else
+    {
+      printLog("No se pudo reconectar a WiFi.");
+    }
+  }
+
   checkWaterLevel();
 
   if (esHoraDeDormir())
