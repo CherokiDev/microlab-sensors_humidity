@@ -9,6 +9,7 @@
 #include <ArduinoJson.h>
 #include "esp_sleep.h"
 #include <vector>
+#include "esp_adc_cal.h"
 
 // ----------------------------- CONFIGURACIÓN ---------------------------------
 
@@ -17,6 +18,7 @@ static constexpr int HUMIDITY_SENSOR_PIN = 34;
 static constexpr int WATER_LEVEL_SENSOR_PIN = 35;
 static constexpr int ONE_WIRE_BUS = 4;
 static constexpr int PUMP_PIN = 25;
+static constexpr int BATTERY_ADC_PIN = 36;
 
 // ADC mapeo
 static constexpr int TIERRA_SECA = 4095;
@@ -81,6 +83,35 @@ static unsigned long lastPublishMillis = 0;
 static bool ntpSynced = false;
 
 std::vector<String> eventosPendientes;
+
+// --- BATERÍA ---
+const adc_bits_width_t BAT_WIDTH = ADC_WIDTH_BIT_12;                        // 12 bits = 0–4095
+const adc_attenuation_t BAT_ATTEN_NEW = (adc_attenuation_t)ADC_ATTEN_DB_12; // para analogSetPinAttenuation()
+const adc_atten_t BAT_ATTEN_OLD = ADC_ATTEN_DB_12;                          // para esp_adc_cal_characterize()
+esp_adc_cal_characteristics_t bat_adc_chars;
+const float BAT_R_TOP = 100000.0;                                       // R1
+const float BAT_R_BOTTOM = 100000.0;                                    // R2
+const float BAT_DIV_FACTOR = (BAT_R_TOP + BAT_R_BOTTOM) / BAT_R_BOTTOM; // (R1 + R2) / R2 = 2.0
+const int BAT_N_POINTS = 6;
+float bat_voltages[BAT_N_POINTS] = {3.00, 3.30, 3.60, 3.80, 4.00, 4.20};
+int bat_percents[BAT_N_POINTS] = {0, 10, 40, 70, 90, 100};
+
+int batteryVoltageToPercent(float v)
+{
+  if (v <= bat_voltages[0])
+    return bat_percents[0];
+  if (v >= bat_voltages[BAT_N_POINTS - 1])
+    return bat_percents[BAT_N_POINTS - 1];
+  for (int i = 0; i < BAT_N_POINTS - 1; i++)
+  {
+    if (v >= bat_voltages[i] && v <= bat_voltages[i + 1])
+    {
+      float t = (v - bat_voltages[i]) / (bat_voltages[i + 1] - bat_voltages[i]);
+      return (int)round(bat_percents[i] + t * (bat_percents[i + 1] - bat_percents[i]));
+    }
+  }
+  return 0;
+}
 
 // -------------------- UTILIDADES ----------------------------------------------
 
@@ -197,6 +228,13 @@ void publishState(float temp)
   doc["umbral"] = state.humedadUmbral;
   doc["duracion"] = state.duracionRiego;
   doc["nivel_agua"] = state.nivelAgua;
+  // --- BATERÍA ---
+  int bat_raw = analogRead(BATTERY_ADC_PIN);
+  uint32_t bat_mv = esp_adc_cal_raw_to_voltage(bat_raw, &bat_adc_chars);
+  float bat_v_adc = bat_mv / 1000.0;
+  float bat_v_bat = bat_v_adc * BAT_DIV_FACTOR;
+  int bat_pct = batteryVoltageToPercent(bat_v_bat);
+  doc["bateria_pct"] = bat_pct;
 
   // Añadir timestamp en formato ISO
   time_t now = time(nullptr);
@@ -374,6 +412,10 @@ void setup()
   pinMode(PUMP_PIN, OUTPUT);
   digitalWrite(PUMP_PIN, LOW);
   sensors.begin();
+  // --- BATERÍA ---
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, BAT_ATTEN_NEW);
+  esp_adc_cal_characterize(ADC_UNIT_1, BAT_ATTEN_OLD, BAT_WIDTH, 1100, &bat_adc_chars);
 
   state.humedadUmbral = Prefs::getUmbral(DEFAULT_UMBRAL);
   state.duracionRiego = Prefs::getDuracion(DEFAULT_RIEGO_MS);
