@@ -84,6 +84,14 @@ static bool ntpSynced = false;
 
 std::vector<String> eventosPendientes;
 
+// --- BATERÍA BAJA / LOW POWER ---
+static int lowBatCount = 0;
+static bool lowBatSleep = false;
+const int LOW_BAT_THRESHOLD = 25; // %
+const int LOW_BAT_COUNT_MAX = 3;
+const int RECOVER_BAT_THRESHOLD = 40;                                         // %
+const uint64_t LOW_BAT_SLEEP_INTERVAL_US = 3ULL * 60ULL * 60ULL * 1000000ULL; // 3 horas
+
 // --- BATERÍA ---
 const adc_bits_width_t BAT_WIDTH = ADC_WIDTH_BIT_12;                        // 12 bits = 0–4095
 const adc_attenuation_t BAT_ATTEN_NEW = (adc_attenuation_t)ADC_ATTEN_DB_12; // para analogSetPinAttenuation()
@@ -463,6 +471,56 @@ void setup()
 
 void loop()
 {
+  // --- GESTIÓN DE BATERÍA BAJA ---
+  int bat_raw = analogRead(BATTERY_ADC_PIN);
+  uint32_t bat_mv = esp_adc_cal_raw_to_voltage(bat_raw, &bat_adc_chars);
+  float bat_v_adc = bat_mv / 1000.0;
+  float bat_v_bat = bat_v_adc * BAT_DIV_FACTOR;
+  int bat_pct = batteryVoltageToPercent(bat_v_bat);
+
+  if (!lowBatSleep)
+  {
+    if (bat_pct < LOW_BAT_THRESHOLD)
+    {
+      lowBatCount++;
+      if (lowBatCount >= LOW_BAT_COUNT_MAX)
+      {
+        printLog("Batería baja (" + String(bat_pct) + "%). Entrando en modo bajo consumo.");
+        // Publica último estado antes de dormir
+        sensors.requestTemperatures();
+        float temp = sensors.getTempCByIndex(0);
+        publishState(temp);
+        delay(500); // Espera para publicar
+        lowBatSleep = true;
+        lowBatCount = 0;
+        esp_sleep_enable_timer_wakeup(LOW_BAT_SLEEP_INTERVAL_US);
+        esp_deep_sleep_start();
+      }
+    }
+    else
+    {
+      lowBatCount = 0;
+    }
+  }
+  else
+  {
+    // Estamos en modo bajo consumo, comprobar si la batería se ha recuperado
+    if (bat_pct >= RECOVER_BAT_THRESHOLD)
+    {
+      printLog("Batería recuperada (" + String(bat_pct) + "%). Saliendo de modo bajo consumo.");
+      lowBatSleep = false;
+      // Continúa con el funcionamiento normal
+    }
+    else
+    {
+      printLog("Batería aún baja (" + String(bat_pct) + "%). Manteniendo modo bajo consumo.");
+      delay(100);
+      esp_sleep_enable_timer_wakeup(LOW_BAT_SLEEP_INTERVAL_US);
+      esp_deep_sleep_start();
+    }
+  }
+
+  // --- RESTO DEL LOOP NORMAL ---
   // Reconexión WiFi si se pierde la conexión
   if (WiFi.status() != WL_CONNECTED)
   {
