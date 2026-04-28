@@ -7,7 +7,6 @@
 #include <PubSubClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
-#include <vector>
 
 // ----------------------------- CONFIGURACIÓN ---------------------------------
 
@@ -16,6 +15,9 @@ static constexpr int HUMIDITY_SENSOR_PIN    = 34;
 static constexpr int WATER_LEVEL_SENSOR_PIN = 35;
 static constexpr int ONE_WIRE_BUS           = 4;
 static constexpr int PUMP_PIN               = 25;
+
+// Pin alimentación sensor resistivo (encendido solo durante la lectura para reducir oxidación)
+static constexpr int SENSOR_POWER_PIN = 26;
 
 // ADC mapeo humedad suelo
 static constexpr int TIERRA_SECA   = 4095;
@@ -39,15 +41,23 @@ static constexpr unsigned long DEFAULT_RIEGO_MS = 60000UL;
 static constexpr float         DEFAULT_UMBRAL   = 70.0f;
 
 // Intervalos
-static constexpr unsigned long HUMEDAD_SAMPLE_INTERVAL_MS = 2000UL;
-static constexpr int           HUMEDAD_SAMPLE_COUNT        = 3;
-static constexpr unsigned long LOOP_PUBLISH_INTERVAL_MS    = 5000UL;
-static constexpr unsigned long WATER_CHECK_INTERVAL_MS     = 250UL;   // max 4 lecturas/s
-static constexpr unsigned long MQTT_RETRY_INTERVAL_MS      = 5000UL;  // reintento no bloqueante
-static constexpr unsigned long WIFI_RECONNECT_TIMEOUT_MS   = 30000UL; // timeout reconexión WiFi
+static constexpr unsigned long HUMEDAD_SAMPLE_INTERVAL_MS  = 2000UL;
+static constexpr int           HUMEDAD_SAMPLE_COUNT         = 3;
+static constexpr unsigned long SENSOR_WARMUP_MS             = 500UL;   // estabilización sensor tras encendido
+static constexpr unsigned long HUMEDAD_CYCLE_INTERVAL_MS    = 30000UL; // ciclo de muestreo cada 30 s
+static constexpr unsigned long DS18B20_CONVERSION_MS        = 750UL;   // tiempo de conversión 12-bit
+static constexpr unsigned long WATER_CHECK_INTERVAL_MS      = 250UL;   // max 4 lecturas/s
+static constexpr unsigned long MQTT_RETRY_INTERVAL_MS       = 5000UL;  // reintento no bloqueante
+static constexpr unsigned long WIFI_RECONNECT_TIMEOUT_MS    = 30000UL; // timeout reconexión WiFi
+static constexpr unsigned long EVENT_DEDUP_MS               = 60000UL; // cooldown entre eventos idénticos consecutivos
+static constexpr unsigned long PUMP_WATER_CHECK_MS          = 250UL;   // intervalo check agua durante riego
+static constexpr int           PUMP_NO_WATER_CONFIRM        = 3;       // lecturas consecutivas sin agua para parar bomba
 
 // Lecturas consecutivas para confirmar cambio de estado del sensor de agua
 static constexpr int WATER_LEVEL_CONFIRM_COUNT = 5;
+
+// Cola de eventos pendientes cuando MQTT está desconectado
+static constexpr int MAX_PENDING_EVENTS = 8;
 
 // NTP
 static constexpr unsigned long NTP_TIMEOUT_MS = 30000UL;
@@ -73,13 +83,27 @@ DeviceState state;
 static bool          bombaEncendida   = false;
 static unsigned long bombaStartMillis = 0;
 static float         lastHumedad      = 0.0f;
+static float         lastTemp         = -127.0f;
+
+// Deduplicación de eventos: cooldown temporal por evento idéntico consecutivo
+static char          lastEventSent[32] = "";
+static unsigned long lastEventMs       = 0;
 
 // Muestreo humedad no bloqueante
 static int           sampleIndex        = 0;
 static int           belowCount         = 0;
+static float         humSum             = 0.0f;
 static unsigned long lastSampleMillis   = 0;
 static bool          samplingInProgress = false;
-static unsigned long lastPublishMillis  = 0;
+static bool          sensorPowered      = false;
+static bool          sensorWarmingUp    = false;
+static unsigned long sensorWarmupStart  = 0;
+static unsigned long lastCycleMillis    = 0;
+static bool          firstSample        = true;  // primera lectura al arrancar
+
+// DS18B20 no bloqueante
+static bool          tempRequested     = false;
+static unsigned long tempRequestMillis = 0;
 
 // Sensor agua no bloqueante
 static unsigned long lastWaterCheckMs  = 0;
@@ -88,13 +112,25 @@ static int           waterConfirmCount = 0; // >0 confirma agua, <0 confirma aus
 // MQTT no bloqueante
 static unsigned long lastMqttAttemptMs = 0;
 
+// Debounce sensor agua durante riego
+static unsigned long pumpWaterCheckMs  = 0;
+static int           pumpNoWaterCount  = 0;
+
+// Cola de eventos pendientes (cuando MQTT está desconectado)
+static char pendingEvents[MAX_PENDING_EVENTS][192];
+static int  pendingEventCount = 0;
+
 // WiFi reconexión no bloqueante
 static bool          wifiReconnecting = false;
 static unsigned long wifiReconnectMs  = 0;
 
 static bool ntpSynced = false;
 
-std::vector<String> eventosPendientes;
+
+
+// Forward declarations (definidas en la sección NTP más abajo)
+static int  getSpainOffset(time_t rawtime);
+static void getLocalTime(time_t utc, struct tm *ti);
 
 // -------------------- UTILIDADES ----------------------------------------------
 
@@ -102,7 +138,7 @@ void printLog(const String &mensaje)
 {
     time_t now = time(nullptr);
     struct tm timeinfo;
-    localtime_r(&now, &timeinfo);
+    getLocalTime(now, &timeinfo);
     char buffer[32];
     strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
     Serial.print("[");
@@ -163,19 +199,29 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
 
     if (String(topic) == MQTT_TOPIC_CONFIG)
     {
-        DynamicJsonDocument doc(256);
+        JsonDocument doc;
         if (deserializeJson(doc, msg)) return;
         if (doc.containsKey("umbral"))
         {
             float u = doc["umbral"].as<float>();
-            state.humedadUmbral = u;
-            Prefs::setUmbral(u);
+            if (u >= 0.0f && u <= 100.0f)
+            {
+                state.humedadUmbral = u;
+                Prefs::setUmbral(u);
+            }
+            else
+                printLog("Umbral rechazado (fuera de rango 0-100): " + String(u));
         }
         if (doc.containsKey("duracion"))
         {
             unsigned long d = doc["duracion"].as<unsigned long>();
-            state.duracionRiego = d;
-            Prefs::setDuracion(d);
+            if (d >= 1000UL && d <= 600000UL)
+            {
+                state.duracionRiego = d;
+                Prefs::setDuracion(d);
+            }
+            else
+                printLog("Duración rechazada (fuera de rango 1000-600000ms): " + String(d));
         }
     }
 }
@@ -191,7 +237,10 @@ void mqttEnsureConnected()
     if (mqttClient.connect(MQTT_CLIENT_NAME.c_str(), MQTT_USER, MQTT_PASSWORD))
     {
         mqttClient.subscribe(MQTT_TOPIC_CONFIG.c_str());
-        mqttClient.publish(MQTT_TOPIC_EVENTS.c_str(), "", true);
+        // Vaciar cola de eventos acumulados durante la desconexión
+        for (int i = 0; i < pendingEventCount; i++)
+            mqttClient.publish(MQTT_TOPIC_EVENTS.c_str(), pendingEvents[i]);
+        pendingEventCount = 0;
         printLog("MQTT conectado.");
     }
     else
@@ -202,96 +251,118 @@ void mqttEnsureConnected()
 
 void publishState(float temp)
 {
-    DynamicJsonDocument doc(256);
+    JsonDocument doc;
     doc["humedad"]     = lastHumedad;
-    doc["temperatura"] = temp;
+    if (temp == DEVICE_DISCONNECTED_C)
+        doc["temperatura"] = nullptr;
+    else
+        doc["temperatura"] = temp;
     doc["umbral"]      = state.humedadUmbral;
     doc["duracion"]    = state.duracionRiego;
     doc["nivel_agua"]  = state.nivelAgua;
 
     time_t now = time(nullptr);
     struct tm timeinfo;
-    localtime_r(&now, &timeinfo);
+    getLocalTime(now, &timeinfo);
     char fecha[40];
     strftime(fecha, sizeof(fecha), "%d %b %Y, %H:%M:%S", &timeinfo);
     doc["timestamp"] = fecha;
 
     char buf[256];
     size_t n = serializeJson(doc, buf);
-    mqttClient.publish(MQTT_TOPIC_BASE.c_str(), buf, n);
+    mqttClient.publish(MQTT_TOPIC_BASE.c_str(), (uint8_t *)buf, n, true);
 }
 
 void addEvent(const char *evento)
 {
-    time_t now = time(nullptr);
+    // Ignorar si es el mismo evento dentro del cooldown (evita spam en ráfaga)
+    // pero sí lo registra si ha pasado más de EVENT_DEDUP_MS (permite histórico completo)
+    unsigned long nowMs = millis();
+    if (strncmp(evento, lastEventSent, sizeof(lastEventSent)) == 0 &&
+        nowMs - lastEventMs < EVENT_DEDUP_MS) return;
+    strncpy(lastEventSent, evento, sizeof(lastEventSent) - 1);
+    lastEventSent[sizeof(lastEventSent) - 1] = '\0';
+    lastEventMs = nowMs;
+
+    time_t nowT = time(nullptr);
     struct tm timeinfo;
-    localtime_r(&now, &timeinfo);
+    getLocalTime(nowT, &timeinfo);
     char fecha[40];
     strftime(fecha, sizeof(fecha), "%d %b %Y, %H:%M:%S", &timeinfo);
 
-    DynamicJsonDocument docEv(64);
-    docEv["evento"] = evento;
-    docEv["fecha"]  = fecha;
-    String evStr;
-    serializeJson(docEv, evStr);
-    eventosPendientes.push_back(evStr);
+    JsonDocument docEv;
+    docEv["evento"]   = evento;
+    docEv["fecha"]    = fecha;
+    docEv["version"]  = APP_VERSION;
+    char buf[192];
+    size_t n = serializeJson(docEv, buf);
 
-    DynamicJsonDocument doc(256);
-    JsonArray arr = doc.to<JsonArray>();
-    for (const auto &ev : eventosPendientes)
-        arr.add(ev);
-    char buf[256];
-    size_t n = serializeJson(doc, buf);
-    mqttClient.publish(MQTT_TOPIC_EVENTS.c_str(), buf, true);
+    if (mqttClient.connected())
+    {
+        mqttClient.publish(MQTT_TOPIC_EVENTS.c_str(), buf, n);
+    }
+    else if (pendingEventCount < MAX_PENDING_EVENTS)
+    {
+        memcpy(pendingEvents[pendingEventCount], buf, n + 1);
+        pendingEventCount++;
+        printLog(String("Evento encolado (MQTT offline): ") + evento);
+    }
 }
 
-void removeEvent(const char *evento)
-{
-    eventosPendientes.erase(
-        std::remove_if(
-            eventosPendientes.begin(),
-            eventosPendientes.end(),
-            [evento](const String &evStr)
-            {
-                DynamicJsonDocument docEv(64);
-                DeserializationError err = deserializeJson(docEv, evStr);
-                if (err) return false;
-                return docEv["evento"] == evento;
-            }),
-        eventosPendientes.end());
-}
+
 
 // -------------------- NTP / ZONA HORARIA ------------------------------------
 
-bool syncTimeSpain(unsigned long timeoutMs = NTP_TIMEOUT_MS)
+// Calcula el offset UTC para España (CET = UTC+1, CEST = UTC+2).
+// Transición: último domingo de marzo a las 01:00 UTC → verano
+//             último domingo de octubre a las 01:00 UTC → invierno
+static int getSpainOffset(time_t rawtime)
 {
-    setenv("TZ", "CET-1CEST-2,M3.5.0/02:00:00,M10.5.0/03:00:00", 1);
-    tzset();
+    struct tm ti_buf;
+    gmtime_r(&rawtime, &ti_buf);
+    int year = ti_buf.tm_year + 1900;
+
+    struct tm lastMarch = {};
+    lastMarch.tm_year = year - 1900;
+    lastMarch.tm_mon  = 2;   // marzo
+    lastMarch.tm_mday = 31;
+    lastMarch.tm_hour = 1;   // 01:00 UTC
+    time_t tMarch = mktime(&lastMarch);
+    struct tm tMarch_buf;
+    lastMarch.tm_mday -= gmtime_r(&tMarch, &tMarch_buf)->tm_wday; // retrocede al domingo
+    tMarch = mktime(&lastMarch);
+
+    struct tm lastOct = {};
+    lastOct.tm_year = year - 1900;
+    lastOct.tm_mon  = 9;     // octubre
+    lastOct.tm_mday = 31;
+    lastOct.tm_hour = 1;     // 01:00 UTC
+    time_t tOct = mktime(&lastOct);
+    struct tm tOct_buf;
+    lastOct.tm_mday -= gmtime_r(&tOct, &tOct_buf)->tm_wday;
+    tOct = mktime(&lastOct);
+
+    return (rawtime >= tMarch && rawtime < tOct) ? 2 * 3600 : 3600;
+}
+
+// Devuelve la hora local de España como struct tm a partir de un timestamp UTC.
+static void getLocalTime(time_t utc, struct tm *ti)
+{
+    time_t local = utc + getSpainOffset(utc);
+    gmtime_r(&local, ti);
+}
+
+// Inicia la sincronización NTP en background (no bloqueante).
+// Sincroniza en UTC puro; el offset horario lo aplica getSpainOffset().
+void beginNtpSync()
+{
     configTime(0, 0, "pool.ntp.org", "time.google.com", "ntp.ubuntu.com");
+    printLog("Sincronización NTP iniciada...");
+}
 
-    unsigned long start = millis();
-    time_t now = time(nullptr);
-    struct tm timeinfo;
-    localtime_r(&now, &timeinfo);
-
-    while ((timeinfo.tm_year < (2020 - 1900)) && (millis() - start) < timeoutMs)
-    {
-        delay(500);
-        now = time(nullptr);
-        localtime_r(&now, &timeinfo);
-        Serial.print('.');
-    }
-
-    if (timeinfo.tm_year < (2020 - 1900))
-    {
-        printLog("No se pudo sincronizar hora NTP dentro del timeout.");
-        return false;
-    }
-
-    char buf[64];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
-    printLog(String("Hora NTP sincronizada: ") + buf);
-    return true;
+bool checkNtpSynced()
+{
+    return time(nullptr) > 1577836800UL; // > 2020-01-01 00:00:00 UTC
 }
 
 // -------------------- SENSOR NIVEL AGUA -------------------------------------
@@ -303,7 +374,8 @@ bool syncTimeSpain(unsigned long timeoutMs = NTP_TIMEOUT_MS)
 //
 // Se requieren WATER_LEVEL_CONFIRM_COUNT lecturas consecutivas en la misma
 // dirección para confirmar un cambio de estado (fail-safe anti-ruido).
-// El contador se resetea si la lectura entra en la zona contraria.
+// El contador se resetea si la lectura entra en la zona contraria y se
+// limita a ±WATER_LEVEL_CONFIRM_COUNT para evitar crecimiento ilimitado.
 void checkWaterLevel()
 {
     unsigned long now = millis();
@@ -315,17 +387,19 @@ void checkWaterLevel()
 
     if (nivel < WATER_PRESENT_THRESHOLD)
     {
-        // Posible agua — acumular confirmaciones en dirección positiva
         if (waterConfirmCount < 0) waterConfirmCount = 0;
         waterConfirmCount++;
+        if (waterConfirmCount > WATER_LEVEL_CONFIRM_COUNT)
+            waterConfirmCount = WATER_LEVEL_CONFIRM_COUNT;
         if (waterConfirmCount >= WATER_LEVEL_CONFIRM_COUNT)
             state.nivelAgua = true;
     }
     else if (nivel > WATER_ABSENT_THRESHOLD)
     {
-        // Posible ausencia de agua — acumular confirmaciones en dirección negativa
         if (waterConfirmCount > 0) waterConfirmCount = 0;
         waterConfirmCount--;
+        if (waterConfirmCount < -WATER_LEVEL_CONFIRM_COUNT)
+            waterConfirmCount = -WATER_LEVEL_CONFIRM_COUNT;
         if (waterConfirmCount <= -WATER_LEVEL_CONFIRM_COUNT)
             state.nivelAgua = false;
     }
@@ -351,6 +425,22 @@ void checkWaterLevel()
 
 void startPump()
 {
+    // Guardia de seguridad: no encender si no hay agua confirmada
+    if (!state.nivelAgua || state.bloqueoSinAgua)
+    {
+        printLog("startPump bloqueado: sin agua");
+        return;
+    }
+    // Apagar sensor si estaba activo (riego interrumpe ciclo de muestreo)
+    if (sensorPowered)
+    {
+        digitalWrite(SENSOR_POWER_PIN, LOW);
+        sensorPowered      = false;
+        sensorWarmingUp    = false;
+        samplingInProgress = false;
+    }
+    pumpNoWaterCount = 0;
+    pumpWaterCheckMs = millis();
     digitalWrite(PUMP_PIN, HIGH);
     bombaEncendida   = true;
     bombaStartMillis = millis();
@@ -372,8 +462,11 @@ void setup()
     pinMode(HUMIDITY_SENSOR_PIN,    INPUT);
     pinMode(WATER_LEVEL_SENSOR_PIN, INPUT);
     pinMode(PUMP_PIN,               OUTPUT);
-    digitalWrite(PUMP_PIN, LOW);
+    pinMode(SENSOR_POWER_PIN,       OUTPUT);
+    digitalWrite(PUMP_PIN,         LOW);
+    digitalWrite(SENSOR_POWER_PIN, LOW);
     sensors.begin();
+    sensors.setWaitForConversion(false); // DS18B20 no bloqueante
 
     state.humedadUmbral = Prefs::getUmbral(DEFAULT_UMBRAL);
     state.duracionRiego = Prefs::getDuracion(DEFAULT_RIEGO_MS);
@@ -391,12 +484,26 @@ void setup()
     if (WiFi.status() == WL_CONNECTED)
     {
         printLog("WiFi conectado.");
-        ntpSynced = syncTimeSpain(NTP_TIMEOUT_MS);
+        beginNtpSync();
+        unsigned long ntpStart = millis();
+        while (!checkNtpSynced() && millis() - ntpStart < NTP_TIMEOUT_MS)
+            delay(200);
+        ntpSynced = checkNtpSynced();
+        if (ntpSynced)
+        {
+            time_t t = time(nullptr);
+            struct tm ti;
+            getLocalTime(t, &ti);
+            char buf[64];
+            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &ti);
+            printLog(String("Hora NTP sincronizada: ") + buf);
+        }
+        else
+            printLog("No se pudo sincronizar hora NTP.");
     }
     else
     {
         printLog("No se pudo conectar a WiFi. Se omite NTP.");
-        ntpSynced = false;
     }
 
     mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
@@ -406,16 +513,60 @@ void setup()
     if (!ntpSynced)
         addEvent("ntp_error");
     else
-    {
-        eventosPendientes.clear();
         addEvent("init_ok");
-    }
 }
 
 // -------------------- LOOP NO BLOQUEANTE ------------------------------------
 
 void loop()
 {
+    // — Reset flag de reconexión si WiFi volvió —
+    if (wifiReconnecting && WiFi.status() == WL_CONNECTED)
+    {
+        wifiReconnecting = false;
+        printLog("WiFi reconectado.");
+        mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+        mqttClient.setCallback(mqttCallback);
+        beginNtpSync(); // no bloqueante: sincroniza en background
+    }
+
+    // — Sensor nivel agua (siempre, independiente de WiFi) —
+    checkWaterLevel();
+
+    // — Control bomba (prioridad máxima, independiente de WiFi) —
+    if (bombaEncendida)
+    {
+        unsigned long pNow = millis();
+        if (pNow - pumpWaterCheckMs >= PUMP_WATER_CHECK_MS)
+        {
+            pumpWaterCheckMs = pNow;
+            int nivel = analogRead(WATER_LEVEL_SENSOR_PIN);
+            if (nivel > WATER_ABSENT_THRESHOLD)
+            {
+                pumpNoWaterCount++;
+                if (pumpNoWaterCount >= PUMP_NO_WATER_CONFIRM)
+                {
+                    pumpNoWaterCount = 0;
+                    stopPump("SIN AGUA");
+                    state.bloqueoSinAgua = true;
+                    addEvent("pump_off_no_water");
+                    return;
+                }
+            }
+            else
+            {
+                pumpNoWaterCount = 0;
+            }
+        }
+        if (millis() - bombaStartMillis >= state.duracionRiego)
+        {
+            pumpNoWaterCount = 0;
+            stopPump("Duracion completada");
+            addEvent("pump_off_done");
+        }
+        return;
+    }
+
     // — Reconexión WiFi no bloqueante —
     if (WiFi.status() != WL_CONNECTED)
     {
@@ -428,81 +579,77 @@ void loop()
             wifiReconnecting = true;
             wifiReconnectMs  = now;
         }
-        else if (WiFi.status() == WL_CONNECTED)
-        {
-            wifiReconnecting = false;
-            printLog("WiFi reconectado.");
-            ntpSynced = syncTimeSpain(NTP_TIMEOUT_MS);
-            mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
-            mqttClient.setCallback(mqttCallback);
-        }
         else if (now - wifiReconnectMs > WIFI_RECONNECT_TIMEOUT_MS)
         {
             wifiReconnecting = false; // reinicia el ciclo de reconexión
             printLog("Timeout reconexión WiFi. Reintentando...");
         }
-        // Sin WiFi seguimos monitorizando el sensor de agua
-        checkWaterLevel();
         return;
     }
 
-    // — Sensor nivel agua —
-    checkWaterLevel();
+    // — NTP: detectar sincronización completada en background —
+    if (!ntpSynced && checkNtpSynced())
+    {
+        ntpSynced = true;
+        time_t t = time(nullptr);
+        struct tm ti;
+        getLocalTime(t, &ti);
+        char buf[64];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &ti);
+        printLog(String("NTP sincronizado: ") + buf);
+    }
 
     // — MQTT no bloqueante —
     mqttEnsureConnected();
     mqttClient.loop();
 
-    // — Control bomba (prioridad máxima dentro del loop) —
-    if (bombaEncendida)
+    // — Muestreo humedad no bloqueante (sensor encendido solo durante la lectura) —
+    unsigned long now = millis();
+
+    // Fase 1: iniciar ciclo si toca (primera vez o cada HUMEDAD_CYCLE_INTERVAL_MS)
+    if (!samplingInProgress && !sensorWarmingUp)
     {
-        int nivel = analogRead(WATER_LEVEL_SENSOR_PIN);
-        if (nivel > WATER_ABSENT_THRESHOLD)
+        if (firstSample || now - lastCycleMillis >= HUMEDAD_CYCLE_INTERVAL_MS)
         {
-            stopPump("SIN AGUA");
-            state.bloqueoSinAgua = true;
-            removeEvent("pump_on");
-            removeEvent("pump_off_done");
-            addEvent("pump_off_no_water");
-            return;
+            firstSample = false;
+            digitalWrite(SENSOR_POWER_PIN, HIGH);
+            sensorPowered     = true;
+            sensorWarmingUp   = true;
+            sensorWarmupStart = now;
+            sampleIndex       = 0;
+            belowCount        = 0;
+            humSum            = 0.0f;
         }
-        if (millis() - bombaStartMillis >= state.duracionRiego)
-        {
-            stopPump("Duracion completada");
-            removeEvent("pump_on");
-            removeEvent("pump_off_no_water");
-            addEvent("pump_off_done");
-        }
-        return;
     }
 
-    // — Muestreo humedad no bloqueante —
-    unsigned long now = millis();
-    if (!samplingInProgress)
+    // Fase 2: esperar estabilización del sensor
+    if (sensorWarmingUp && now - sensorWarmupStart >= SENSOR_WARMUP_MS)
     {
+        sensorWarmingUp    = false;
         samplingInProgress = true;
-        sampleIndex        = 0;
-        belowCount         = 0;
         lastSampleMillis   = now;
     }
 
-    if (now - lastSampleMillis >= HUMEDAD_SAMPLE_INTERVAL_MS)
+    // Fase 3: tomar muestras
+    if (samplingInProgress && now - lastSampleMillis >= HUMEDAD_SAMPLE_INTERVAL_MS)
     {
         lastSampleMillis = now;
         int sensorValue = analogRead(HUMIDITY_SENSOR_PIN);
         float humedad = (float)(TIERRA_SECA - sensorValue) / (TIERRA_SECA - TIERRA_HUMEDA) * 100.0f;
         humedad = constrain(humedad, 0.0f, 100.0f);
-        lastHumedad = humedad;
+        humSum += humedad;
         if (humedad < state.humedadUmbral)
             belowCount++;
         sampleIndex++;
 
         if (sampleIndex >= HUMEDAD_SAMPLE_COUNT)
         {
+            lastHumedad        = humSum / HUMEDAD_SAMPLE_COUNT; // media del ciclo
             samplingInProgress = false;
-            removeEvent("pump_off_done");
-            removeEvent("pump_off_no_water");
-            removeEvent("pump_blocked_no_water");
+            // Apagar sensor: ya no hace falta hasta el siguiente ciclo
+            digitalWrite(SENSOR_POWER_PIN, LOW);
+            sensorPowered   = false;
+            lastCycleMillis = now;
 
             if (belowCount == HUMEDAD_SAMPLE_COUNT && !state.bloqueoSinAgua)
             {
@@ -514,15 +661,23 @@ void loop()
                 printLog("Intento de riego bloqueado: sin agua");
                 addEvent("pump_blocked_no_water");
             }
+
+            // Solicitar temperatura al final del ciclo; se publica 750 ms después
+            sensors.requestTemperatures();
+            tempRequested     = true;
+            tempRequestMillis = now;
         }
     }
 
-    // — Publicar estado MQTT cada LOOP_PUBLISH_INTERVAL_MS —
-    if (now - lastPublishMillis >= LOOP_PUBLISH_INTERVAL_MS)
+    // — Publicación MQTT: leer temperatura y publicar tras conversión DS18B20 —
+    if (tempRequested && now - tempRequestMillis >= DS18B20_CONVERSION_MS)
     {
-        lastPublishMillis = now;
-        sensors.requestTemperatures();
-        float temp = sensors.getTempCByIndex(0);
-        publishState(temp);
+        tempRequested = false;
+        float t = sensors.getTempCByIndex(0);
+        if (t == DEVICE_DISCONNECTED_C)
+            addEvent("sensor_temp_error");
+        else
+            lastTemp = t;
+        publishState(lastTemp);
     }
 }
