@@ -16,12 +16,14 @@ static constexpr int WATER_LEVEL_SENSOR_PIN = 35;
 static constexpr int ONE_WIRE_BUS           = 4;
 static constexpr int PUMP_PIN               = 25;
 
-// Pin alimentación sensor resistivo (encendido solo durante la lectura para reducir oxidación)
+// Pin alimentación sensor de humedad (encendido solo durante la lectura para reducir oxidación/desgaste)
 static constexpr int SENSOR_POWER_PIN = 26;
 
-// ADC mapeo humedad suelo
-static constexpr int TIERRA_SECA   = 4095;
-static constexpr int TIERRA_HUMEDA = 1000;
+// ADC mapeo humedad suelo (calibrado con el sensor capacitivo actual: seco al aire / sumergido en agua)
+// Si en el futuro se vuelve a usar el sensor resistivo, sus valores de calibración
+// eran TIERRA_SECA = 4095 y TIERRA_HUMEDA = 1000.
+static constexpr int TIERRA_SECA   = 2400;
+static constexpr int TIERRA_HUMEDA = 950;
 
 // Sensor de nivel de agua (capacitivo externo, no sumergible):
 //   ADC ~0    → hay agua en el depósito (sensor conduce)
@@ -62,6 +64,21 @@ static constexpr int MAX_PENDING_EVENTS = 8;
 // NTP
 static constexpr unsigned long NTP_TIMEOUT_MS = 30000UL;
 
+// ---- Deep Sleep / Ventana horaria (desactivado: alimentación continua) ----
+// static constexpr int WAKE_HOUR   = 12; // 12:00
+// static constexpr int WAKE_MINUTE = 0;
+//
+// // Hora de fin: el ESP32 se duerme en cuanto el ciclo de trabajo termina
+// // y no se vuelve a despertar hasta el día siguiente a WAKE_HOUR:WAKE_MINUTE.
+// // Durante la ventana (WAKE_HOUR:WAKE_MINUTE → SLEEP_HOUR:SLEEP_MINUTE) se
+// // ejecuta el loop normal. Al salir de la ventana, entra en deep sleep.
+// static constexpr int SLEEP_HOUR   = 12; // 12:30
+// static constexpr int SLEEP_MINUTE = 30;
+//
+// // Cuántos ciclos de muestreo se completan antes de dormirse
+// // (0 = dormir en cuanto se publique el primer ciclo completo)
+// static constexpr int CYCLES_BEFORE_SLEEP = 5;
+
 // ------------------------------------------------------------------------------
 
 OneWire oneWire(ONE_WIRE_BUS);
@@ -84,6 +101,7 @@ static bool          bombaEncendida   = false;
 static unsigned long bombaStartMillis = 0;
 static float         lastHumedad      = 0.0f;
 static float         lastTemp         = -127.0f;
+static bool          lastTempValida   = false;
 
 // Deduplicación de eventos: cooldown temporal por evento idéntico consecutivo
 static char          lastEventSent[32] = "";
@@ -91,7 +109,6 @@ static unsigned long lastEventMs       = 0;
 
 // Muestreo humedad no bloqueante
 static int           sampleIndex        = 0;
-static int           belowCount         = 0;
 static float         humSum             = 0.0f;
 static unsigned long lastSampleMillis   = 0;
 static bool          samplingInProgress = false;
@@ -125,6 +142,10 @@ static bool          wifiReconnecting = false;
 static unsigned long wifiReconnectMs  = 0;
 
 static bool ntpSynced = false;
+
+// Deep sleep (desactivado: alimentación continua)
+// static int  completedCycles  = 0;
+// static bool readyToSleep     = false;
 
 
 
@@ -253,7 +274,7 @@ void publishState(float temp)
 {
     JsonDocument doc;
     doc["humedad"]     = lastHumedad;
-    if (temp == DEVICE_DISCONNECTED_C)
+    if (!lastTempValida)
         doc["temperatura"] = nullptr;
     else
         doc["temperatura"] = temp;
@@ -297,15 +318,13 @@ void addEvent(const char *evento)
     char buf[192];
     size_t n = serializeJson(docEv, buf);
 
-    if (mqttClient.connected())
-    {
-        mqttClient.publish(MQTT_TOPIC_EVENTS.c_str(), buf, n);
-    }
-    else if (pendingEventCount < MAX_PENDING_EVENTS)
+    bool enviado = mqttClient.connected() && mqttClient.publish(MQTT_TOPIC_EVENTS.c_str(), buf, n);
+
+    if (!enviado && pendingEventCount < MAX_PENDING_EVENTS)
     {
         memcpy(pendingEvents[pendingEventCount], buf, n + 1);
         pendingEventCount++;
-        printLog(String("Evento encolado (MQTT offline): ") + evento);
+        printLog(String("Evento encolado (MQTT offline o publish fallido): ") + evento);
     }
 }
 
@@ -423,13 +442,13 @@ void checkWaterLevel()
 
 // -------------------- RIEGO --------------------------------------------------
 
-void startPump()
+bool startPump()
 {
     // Guardia de seguridad: no encender si no hay agua confirmada
     if (!state.nivelAgua || state.bloqueoSinAgua)
     {
         printLog("startPump bloqueado: sin agua");
-        return;
+        return false;
     }
     // Apagar sensor si estaba activo (riego interrumpe ciclo de muestreo)
     if (sensorPowered)
@@ -445,6 +464,7 @@ void startPump()
     bombaEncendida   = true;
     bombaStartMillis = millis();
     printLog("Bomba ENCENDIDA (humedad < " + String(state.humedadUmbral) + "%)");
+    return true;
 }
 
 void stopPump(const String &reason)
@@ -453,6 +473,50 @@ void stopPump(const String &reason)
     bombaEncendida = false;
     printLog("Bomba APAGADA: " + reason);
 }
+
+// -------------------- DEEP SLEEP (desactivado: alimentación continua) --------
+
+// bool enVentanaActiva()
+// {
+//     if (!ntpSynced) return true;
+//     time_t now = time(nullptr);
+//     struct tm ti;
+//     getLocalTime(now, &ti);
+//     int minActual   = ti.tm_hour * 60 + ti.tm_min;
+//     int minInicio   = WAKE_HOUR  * 60 + WAKE_MINUTE;
+//     int minFin      = SLEEP_HOUR * 60 + SLEEP_MINUTE;
+//     return (minActual >= minInicio && minActual < minFin);
+// }
+
+// void enterDeepSleep()
+// {
+//     digitalWrite(PUMP_PIN,         LOW);
+//     digitalWrite(SENSOR_POWER_PIN, LOW);
+//
+//     long segundosDormir = 0;
+//     if (ntpSynced)
+//     {
+//         time_t now = time(nullptr);
+//         struct tm ti;
+//         getLocalTime(now, &ti);
+//         int segActual    = ti.tm_hour * 3600 + ti.tm_min * 60 + ti.tm_sec;
+//         int segObjetivo  = WAKE_HOUR  * 3600 + WAKE_MINUTE * 60;
+//         segundosDormir   = segObjetivo - segActual;
+//         if (segundosDormir <= 0) segundosDormir += 24L * 3600;
+//     }
+//     else
+//     {
+//         segundosDormir = 23L * 3600;
+//     }
+//
+//     printLog("Entrando en deep sleep. Próximo despertar en " +
+//              String(segundosDormir / 3600) + "h " +
+//              String((segundosDormir % 3600) / 60) + "min.");
+//     Serial.flush();
+//     delay(100);
+//     esp_sleep_enable_timer_wakeup((uint64_t)segundosDormir * 1000000ULL);
+//     esp_deep_sleep_start();
+// }
 
 // -------------------- SETUP --------------------------------------------------
 
@@ -506,8 +570,19 @@ void setup()
         printLog("No se pudo conectar a WiFi. Se omite NTP.");
     }
 
+    // Deep sleep desactivado: alimentación continua
+    // if (!enVentanaActiva())
+    // {
+    //     printLog("Fuera de ventana horaria. Volviendo a dormir...");
+    //     enterDeepSleep();
+    // }
+
     mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
+    // > duración máxima de riego (600 s) para que el broker no cierre la conexión
+    // por falta de PINGREQ mientras la bomba está encendida (mqttClient.loop() no
+    // se llama durante el riego, ver bombaEncendida en loop()).
+    mqttClient.setKeepAlive(650);
     mqttEnsureConnected();
 
     if (!ntpSynced)
@@ -617,7 +692,6 @@ void loop()
             sensorWarmingUp   = true;
             sensorWarmupStart = now;
             sampleIndex       = 0;
-            belowCount        = 0;
             humSum            = 0.0f;
         }
     }
@@ -638,8 +712,6 @@ void loop()
         float humedad = (float)(TIERRA_SECA - sensorValue) / (TIERRA_SECA - TIERRA_HUMEDA) * 100.0f;
         humedad = constrain(humedad, 0.0f, 100.0f);
         humSum += humedad;
-        if (humedad < state.humedadUmbral)
-            belowCount++;
         sampleIndex++;
 
         if (sampleIndex >= HUMEDAD_SAMPLE_COUNT)
@@ -651,12 +723,12 @@ void loop()
             sensorPowered   = false;
             lastCycleMillis = now;
 
-            if (belowCount == HUMEDAD_SAMPLE_COUNT && !state.bloqueoSinAgua)
+            if (lastHumedad < state.humedadUmbral && !state.bloqueoSinAgua)
             {
-                startPump();
-                addEvent("pump_on");
+                if (startPump())
+                    addEvent("pump_on");
             }
-            else if (belowCount == HUMEDAD_SAMPLE_COUNT && state.bloqueoSinAgua)
+            else if (lastHumedad < state.humedadUmbral && state.bloqueoSinAgua)
             {
                 printLog("Intento de riego bloqueado: sin agua");
                 addEvent("pump_blocked_no_water");
@@ -675,9 +747,29 @@ void loop()
         tempRequested = false;
         float t = sensors.getTempCByIndex(0);
         if (t == DEVICE_DISCONNECTED_C)
+        {
+            lastTempValida = false;
             addEvent("sensor_temp_error");
+        }
         else
-            lastTemp = t;
+        {
+            lastTemp       = t;
+            lastTempValida = true;
+        }
         publishState(lastTemp);
+
+        // Deep sleep desactivado: alimentación continua
+        // completedCycles++;
+        // if (!enVentanaActiva() || completedCycles >= CYCLES_BEFORE_SLEEP)
+        // {
+        //     addEvent("sleep");
+        //     unsigned long tFlush = millis();
+        //     while (millis() - tFlush < 500)
+        //     {
+        //         mqttClient.loop();
+        //         delay(10);
+        //     }
+        //     enterDeepSleep();
+        // }
     }
 }
